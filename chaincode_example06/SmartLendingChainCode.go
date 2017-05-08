@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"strconv"
+	"time"
 	"unicode/utf8"
 
 	"github.com/hyperledger/fabric/core/chaincode/shim"
@@ -22,18 +23,28 @@ const DEALER = "dealer"
 const LENDER = "lender"
 
 //==============================================================================================================================
-//	 Status types - Auto Finance Workflow Status
+//	 Status types - Loan Application
 //==============================================================================================================================
 const STATE_APPLIED = 0
 const STATE_QUOTATIONS_RECEIVED = 1
 const STATE_BID_ACCEPTED = 2
 const STATE_BID_REJECTED = 3
+const STATE_PERFORMING = 4
+const STATE_NON_PERFORMING = 5
 
 //==============================================================================================================================
-//	 Other constants
+//	Status types - Lender accept status of an application
 //==============================================================================================================================
 const LENDER_ACCEPT_APPLICATION = 1
 const LENDER_REJECT_APPLICATION = 0
+
+//==============================================================================================================================
+//	Status types - Payment status
+//==============================================================================================================================
+const STATE_NOT_DEMANDED = 0
+const STATE_DEMANDED = 1
+const STATE_RECOVERED = 2
+const STATE_MISSED = 3
 
 //==============================================================================================================================
 //	 Structure Definitions
@@ -50,6 +61,7 @@ type SmartLendingChaincode struct {
 
 type LoanApplication struct {
 	ApplicationNumber string
+	AccountNumber     int
 	Make              string
 	Model             string
 	LoanAmount        float64
@@ -58,8 +70,10 @@ type LoanApplication struct {
 	MonthlyIncome     float64
 	CreditScore       int
 	Status            int
+	Tenure            int
 	Transactions      []TransactionMetadata
 	Quotations        []BiddingDetails
+	RepaymentSchedule []PaymentDetail
 }
 
 type EvaluationParams struct {
@@ -69,15 +83,18 @@ type EvaluationParams struct {
 	Age               int
 	MonthlyIncome     float64
 	CreditScore       int
+	Tenure            int
 }
 
 type BiddingDetails struct {
 	ApplicationNumber       string
 	BiddingNumber           int
+	BiddingDate             time.Time
 	LenderId                int
 	SanctionedAmount        float64
 	InterestType            string
-	InterestRate            float32
+	InterestRate            float64
+	Tenure                  int
 	ApplicationAcceptStatus int
 	RejectionReason         string
 	IsWinningBid            bool
@@ -87,7 +104,18 @@ type TransactionMetadata struct {
 	ApplicationState     int
 	TransactionId        string
 	TransactionTimestamp string
+	TransactionDate      time.Time
 	CallerMetadata       []byte
+}
+
+type PaymentDetail struct {
+	InstallmentNumber int
+	PrincipalAmount   float64
+	InterestAmount    float64
+	TotalEMI          float64
+	RepaymentStatus   int
+	RepaymentDate     string
+	Metadata          TransactionMetadata
 }
 
 //==============================================================================================================================
@@ -122,6 +150,8 @@ func (t *SmartLendingChaincode) Invoke(stub shim.ChaincodeStubInterface, functio
 		return t.CreateLoanApplication(stub, args)
 	} else if function == "ConfirmBid" {
 		return t.ConfirmBid(stub, args)
+	} else if function == "ChangePaymentStatus" {
+		return t.ChangePaymentStatus(stub, args)
 	}
 	fmt.Println("Function not found")
 	return nil, errors.New("Invalid invoke function name")
@@ -153,6 +183,7 @@ func (t *SmartLendingChaincode) CreateLoanApplication(stub shim.ChaincodeStubInt
 	age, err := strconv.Atoi(applicationArgs[5])
 	monthlyIncome, err := strconv.ParseFloat(applicationArgs[6], 64)
 	creditScore, err := strconv.Atoi(applicationArgs[7])
+	loanTenure, err := strconv.Atoi(applicationArgs[8])
 
 	applicationDetails := LoanApplication{ApplicationNumber: applicationNumber, Make: make, Model: model, LoanAmount: loanAmount, SSN: ssn, Age: age, MonthlyIncome: monthlyIncome, CreditScore: creditScore, Status: STATE_APPLIED}
 
@@ -160,7 +191,7 @@ func (t *SmartLendingChaincode) CreateLoanApplication(stub shim.ChaincodeStubInt
 	applicationDetails = t.SaveApplicationDetails(stub, applicationDetails)
 
 	// Prepare the evaluation parameters
-	evaluationParams := EvaluationParams{ApplicationNumber: applicationNumber, LoanAmount: loanAmount, SSN: ssn, Age: age, MonthlyIncome: monthlyIncome, CreditScore: creditScore}
+	evaluationParams := EvaluationParams{ApplicationNumber: applicationNumber, LoanAmount: loanAmount, SSN: ssn, Age: age, MonthlyIncome: monthlyIncome, CreditScore: creditScore, Tenure: loanTenure}
 
 	// Get quotes from lenders
 	quoteFromLender1 := t.GetQuoteFromLender1(evaluationParams)
@@ -186,7 +217,6 @@ func (t *SmartLendingChaincode) CreateLoanApplication(stub shim.ChaincodeStubInt
 func (t *SmartLendingChaincode) ConfirmBid(stub shim.ChaincodeStubInterface, applicationArgs []string) ([]byte, error) {
 
 	bytes, err := stub.GetState(applicationArgs[0])
-	fmt.Println("before converting JSON")
 	biddingNumber, err := strconv.Atoi(applicationArgs[1])
 	bidStatus, err := strconv.Atoi(applicationArgs[2])
 	var applicationDetails LoanApplication
@@ -202,11 +232,51 @@ func (t *SmartLendingChaincode) ConfirmBid(stub shim.ChaincodeStubInterface, app
 	for i := 0; i < len(applicationDetails.Quotations); i++ {
 		if applicationDetails.Quotations[i].BiddingNumber == biddingNumber && bidStatus == STATE_BID_ACCEPTED {
 			applicationDetails.Quotations[i].IsWinningBid = true
+			applicationDetails.AccountNumber = t.GenerateAccountNumber()
+			applicationDetails.RepaymentSchedule = t.GenerateRepaymentSchedule(applicationDetails.Quotations[i])
 		}
 	}
 
 	fmt.Println("after setting bid")
 
+	applicationDetails = t.SaveApplicationDetails(stub, applicationDetails)
+
+	bytes, err = json.Marshal(applicationDetails)
+
+	return bytes, err
+}
+
+func (t *SmartLendingChaincode) ChangePaymentStatus(stub shim.ChaincodeStubInterface, applicationArgs []string) ([]byte, error) {
+
+	// Gather the inputs
+	applicationNumber := applicationArgs[0]
+	installmentNumber, err := strconv.Atoi(applicationArgs[2])
+	repaymentStatus, err := strconv.Atoi(applicationArgs[3])
+
+	// Get the application details
+	var applicationDetails LoanApplication
+	bytes, err := stub.GetState(applicationNumber)
+	err = json.Unmarshal(bytes, &applicationDetails)
+
+	// Loop through the repayment schedule and change the payment status
+	for i := 0; i < len(applicationDetails.RepaymentSchedule); i++ {
+		if applicationDetails.RepaymentSchedule[i].InstallmentNumber == installmentNumber {
+			applicationDetails.RepaymentSchedule[i].RepaymentStatus = repaymentStatus
+			var metadata TransactionMetadata
+			metadata.TransactionId = stub.GetTxID()
+			txnTimeStamp, err := stub.GetTxTimestamp()
+			if err == nil {
+				metadata.TransactionTimestamp = txnTimeStamp.String()
+			}
+			metadata.CallerMetadata, err = stub.GetCallerMetadata()
+			metadata.TransactionDate = time.Now()
+			applicationDetails.RepaymentSchedule[i].Metadata = metadata
+			break
+		}
+	}
+
+	// Get the revised loan application status
+	applicationDetails = t.CheckLoanDefaultStatus(applicationDetails)
 	applicationDetails = t.SaveApplicationDetails(stub, applicationDetails)
 
 	bytes, err = json.Marshal(applicationDetails)
@@ -259,6 +329,7 @@ func (t *SmartLendingChaincode) GetTransactionMetadata(stub shim.ChaincodeStubIn
 	var metadata TransactionMetadata
 	metadata.ApplicationState = applicationDetails.Status
 	metadata.TransactionId = stub.GetTxID()
+	metadata.TransactionDate = time.Now()
 	txnTimeStamp, err := stub.GetTxTimestamp()
 	if err == nil {
 		metadata.TransactionTimestamp = txnTimeStamp.String()
@@ -295,8 +366,10 @@ func (t *SmartLendingChaincode) GetQuoteFromLender1(evaluationParams EvaluationP
 		// ==================================================================
 		bidDetails.ApplicationAcceptStatus = LENDER_ACCEPT_APPLICATION
 		bidDetails.BiddingNumber = t.GenerateBiddingNumber()
+		bidDetails.BiddingDate = time.Now()
 		bidDetails.LenderId = 1
 		bidDetails.SanctionedAmount = evaluationParams.LoanAmount
+		bidDetails.Tenure = evaluationParams.Tenure
 		bidDetails.InterestType = "simple"
 
 		// Calculate interest rate
@@ -321,7 +394,7 @@ func (t *SmartLendingChaincode) GetQuoteFromLender1(evaluationParams EvaluationP
 		}
 
 		finalRate := baseRate + delta
-		bidDetails.InterestRate = finalRate
+		bidDetails.InterestRate = float64(finalRate)
 		bidDetails.IsWinningBid = false
 	}
 
@@ -354,8 +427,10 @@ func (t *SmartLendingChaincode) GetQuoteFromLender2(evaluationParams EvaluationP
 		// ==================================================================
 		bidDetails.ApplicationAcceptStatus = LENDER_ACCEPT_APPLICATION
 		bidDetails.BiddingNumber = t.GenerateBiddingNumber()
+		bidDetails.BiddingDate = time.Now()
 		bidDetails.LenderId = 2
 		bidDetails.SanctionedAmount = evaluationParams.LoanAmount
+		bidDetails.Tenure = evaluationParams.Tenure
 		bidDetails.InterestType = "floating"
 
 		// Calculate interest rate
@@ -380,7 +455,7 @@ func (t *SmartLendingChaincode) GetQuoteFromLender2(evaluationParams EvaluationP
 		}
 
 		finalRate := baseRate + delta
-		bidDetails.InterestRate = finalRate
+		bidDetails.InterestRate = float64(finalRate)
 		bidDetails.IsWinningBid = false
 	}
 
@@ -413,8 +488,10 @@ func (t *SmartLendingChaincode) GetQuoteFromLender3(evaluationParams EvaluationP
 		// ==================================================================
 		bidDetails.ApplicationAcceptStatus = LENDER_ACCEPT_APPLICATION
 		bidDetails.BiddingNumber = t.GenerateBiddingNumber()
+		bidDetails.BiddingDate = time.Now()
 		bidDetails.LenderId = 3
 		bidDetails.SanctionedAmount = evaluationParams.LoanAmount
+		bidDetails.Tenure = evaluationParams.Tenure
 		bidDetails.InterestType = "simple"
 
 		// Calculate interest rate
@@ -439,7 +516,7 @@ func (t *SmartLendingChaincode) GetQuoteFromLender3(evaluationParams EvaluationP
 		}
 
 		finalRate := baseRate + delta
-		bidDetails.InterestRate = finalRate
+		bidDetails.InterestRate = float64(finalRate)
 		bidDetails.IsWinningBid = false
 	}
 
@@ -472,8 +549,10 @@ func (t *SmartLendingChaincode) GetQuoteFromLender4(evaluationParams EvaluationP
 		// ==================================================================
 		bidDetails.ApplicationAcceptStatus = LENDER_ACCEPT_APPLICATION
 		bidDetails.BiddingNumber = t.GenerateBiddingNumber()
+		bidDetails.BiddingDate = time.Now()
 		bidDetails.LenderId = 4
 		bidDetails.SanctionedAmount = evaluationParams.LoanAmount
+		bidDetails.Tenure = evaluationParams.Tenure
 		bidDetails.InterestType = "floating"
 
 		// Calculate interest rate
@@ -498,7 +577,7 @@ func (t *SmartLendingChaincode) GetQuoteFromLender4(evaluationParams EvaluationP
 		}
 
 		finalRate := baseRate + delta
-		bidDetails.InterestRate = finalRate
+		bidDetails.InterestRate = float64(finalRate)
 		bidDetails.IsWinningBid = false
 	}
 
@@ -512,6 +591,57 @@ func (t *SmartLendingChaincode) GenerateBiddingNumber() int {
 	biddingNumber = rand.Intn(100000)
 
 	return biddingNumber
+}
+
+func (t *SmartLendingChaincode) GenerateAccountNumber() int {
+	var accountNumber int = 0
+
+	// TODO : Store max bid number used in ledger and return the next number and remove random generation
+	accountNumber = rand.Intn(100000)
+
+	return accountNumber
+}
+
+func (t *SmartLendingChaincode) GenerateRepaymentSchedule(winningQuotation BiddingDetails) []PaymentDetail {
+	var repaymentSchedule []PaymentDetail
+	var noOfInstallments int
+
+	// Construct the repayment RepaymentSchedule
+	noOfInstallments = winningQuotation.Tenure * 12
+
+	for i := 0; i < noOfInstallments; i++ {
+		// Construct the installment details
+		var installmentDetail PaymentDetail
+
+		installmentDetail.InstallmentNumber = i + 1
+		installmentDetail.PrincipalAmount = winningQuotation.SanctionedAmount / float64(noOfInstallments)
+		installmentDetail.InterestAmount = (installmentDetail.PrincipalAmount * winningQuotation.InterestRate) / float64(100)
+		installmentDetail.TotalEMI = installmentDetail.PrincipalAmount + installmentDetail.InterestAmount
+		installmentDetail.RepaymentStatus = STATE_DEMANDED
+		repaymentSchedule = append(repaymentSchedule, installmentDetail)
+	}
+
+	return repaymentSchedule
+}
+
+func (t *SmartLendingChaincode) CheckLoanDefaultStatus(applicationDetails LoanApplication) LoanApplication {
+
+	// Loop through the repayment schedule to mark the loan default status accordingly
+	var countOfMissedPayments int = 0
+	for i := 0; i < len(applicationDetails.RepaymentSchedule); i++ {
+		if applicationDetails.RepaymentSchedule[i].RepaymentStatus == STATE_MISSED {
+			countOfMissedPayments++
+		}
+	}
+
+	// Mark the loan as default if missed payments are more than 3
+	if countOfMissedPayments >= 3 {
+		applicationDetails.Status = STATE_NON_PERFORMING
+	} else {
+		applicationDetails.Status = STATE_PERFORMING
+	}
+
+	return applicationDetails
 }
 
 //==============================================================================================================================
